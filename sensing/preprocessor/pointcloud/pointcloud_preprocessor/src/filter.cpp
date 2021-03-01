@@ -73,6 +73,40 @@ pointcloud_preprocessor::Filter::Filter(
     latched_indices_ = static_cast<bool>(declare_parameter("latched_indices", false));
     approximate_sync_ = static_cast<bool>(declare_parameter("approximate_sync", false));
 
+    // QoS reliability parameter
+    rcl_interfaces::msg::ParameterDescriptor reliability_desc;
+    reliability_desc.description = "Reliability QoS setting for the filter";
+    reliability_desc.additional_constraints = "Must be one of: ";
+    for (auto entry : name_to_reliability_policy_map) {
+      reliability_desc.additional_constraints += entry.first + " ";
+    }
+    const std::string reliability_param = this->declare_parameter(
+      "reliability", "best_effort", reliability_desc);
+    auto reliability = name_to_reliability_policy_map.find(reliability_param);
+    if (reliability == name_to_reliability_policy_map.end()) {
+      std::ostringstream oss;
+      oss << "Invalid QoS reliability setting '" << reliability_param << "'";
+      throw std::runtime_error(oss.str());
+    }
+    reliability_policy_ = reliability->second;
+
+    // QoS history parameter
+    rcl_interfaces::msg::ParameterDescriptor history_desc;
+    history_desc.description = "History QoS setting for the filter";
+    history_desc.additional_constraints = "Must be one of: ";
+    for (auto entry : name_to_history_policy_map) {
+      history_desc.additional_constraints += entry.first + " ";
+    }
+    const std::string history_param = this->declare_parameter(
+      "history", "keep_last", history_desc);
+    auto history = name_to_history_policy_map.find(history_param);
+    if (history == name_to_history_policy_map.end()) {
+      std::ostringstream oss;
+      oss << "Invalid QoS history setting '" << history_param << "'";
+      throw std::runtime_error(oss.str());
+    }
+    history_policy_ = history->second;
+
     RCLCPP_INFO_STREAM(
       this->get_logger(),
       "Filter (as Component) successfully created with the following parameters:" <<
@@ -80,12 +114,18 @@ pointcloud_preprocessor::Filter::Filter(
         " - approximate_sync : " << (approximate_sync_ ? "true" : "false") << std::endl <<
         " - use_indices      : " << (use_indices_ ? "true" : "false") << std::endl <<
         " - latched_indices  : " << (latched_indices_ ? "true" : "false") << std::endl <<
-        " - max_queue_size   : " << max_queue_size_);
+        " - max_queue_size   : " << max_queue_size_ << std::endl <<
+        " - reliability      : " << reliability->first << std::endl <<
+        " - history          : " << history->first << std::endl);
   }
+
+  // QoS
+  auto qos = rclcpp::QoS(rclcpp::QoSInitialization(history_policy_, max_queue_size_));
+  qos.reliability(reliability_policy_);
 
   // Set publisher
   {
-    pub_output_ = this->create_publisher<PointCloud2>("output", max_queue_size_);
+    pub_output_ = this->create_publisher<PointCloud2>("output", qos);
   }
 
   // Set subscriber
@@ -93,9 +133,9 @@ pointcloud_preprocessor::Filter::Filter(
     if (use_indices_) {
       // Subscribe to the input using a filter
       sub_input_filter_.subscribe(
-        this, "input", rclcpp::QoS{max_queue_size_}.get_rmw_qos_profile());
+        this, "input", qos.get_rmw_qos_profile());
       sub_indices_filter_.subscribe(
-        this, "indices", rclcpp::QoS{max_queue_size_}.get_rmw_qos_profile());
+        this, "indices", qos.get_rmw_qos_profile());
 
       if (approximate_sync_) {
         sync_input_indices_a_ = std::make_shared<ApproximateTimeSyncPolicy>(max_queue_size_);
@@ -115,7 +155,7 @@ pointcloud_preprocessor::Filter::Filter(
       // CAN'T use auto-type here.
       std::function<void(const PointCloud2ConstPtr msg)> cb = std::bind(
         &Filter::input_indices_callback, this, std::placeholders::_1, PointIndicesConstPtr());
-      sub_input_ = create_subscription<PointCloud2>("input", rclcpp::QoS{max_queue_size_}, cb);
+      sub_input_ = create_subscription<PointCloud2>("input", qos, cb);
     }
   }
 

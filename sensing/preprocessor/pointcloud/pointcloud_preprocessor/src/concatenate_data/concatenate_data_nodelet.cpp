@@ -55,6 +55,7 @@
 #include <utility>
 #include <vector>
 
+#include "pointcloud_preprocessor/filter.hpp"
 #include "pointcloud_preprocessor/concatenate_data/concatenate_data_nodelet.hpp"
 
 #include "pcl_ros/transforms.hpp"
@@ -90,14 +91,53 @@ PointCloudConcatenateDataSynchronizerComponent::PointCloudConcatenateDataSynchro
     // Optional parameters
     maximum_queue_size_ = static_cast<int>(declare_parameter("max_queue_size", 3));
     timeout_sec_ = static_cast<double>(declare_parameter("timeout_sec", 0.1));
+
+    // QoS reliability parameter
+    rcl_interfaces::msg::ParameterDescriptor reliability_desc;
+    reliability_desc.description = "Reliability QoS setting for the filter";
+    reliability_desc.additional_constraints = "Must be one of: ";
+    for (auto entry : name_to_reliability_policy_map) {
+      reliability_desc.additional_constraints += entry.first + " ";
+    }
+    const std::string reliability_param = this->declare_parameter(
+      "reliability", "best_effort", reliability_desc);
+    auto reliability = name_to_reliability_policy_map.find(reliability_param);
+    if (reliability == name_to_reliability_policy_map.end()) {
+      std::ostringstream oss;
+      oss << "Invalid QoS reliability setting '" << reliability_param << "'";
+      throw std::runtime_error(oss.str());
+    }
+    reliability_policy_ = reliability->second;
+
+    // QoS history parameter
+    rcl_interfaces::msg::ParameterDescriptor history_desc;
+    history_desc.description = "History QoS setting for the filter";
+    history_desc.additional_constraints = "Must be one of: ";
+    for (auto entry : name_to_history_policy_map) {
+      history_desc.additional_constraints += entry.first + " ";
+    }
+    const std::string history_param = this->declare_parameter(
+      "history", "keep_last", history_desc);
+    auto history = name_to_history_policy_map.find(history_param);
+    if (history == name_to_history_policy_map.end()) {
+      std::ostringstream oss;
+      oss << "Invalid QoS history setting '" << history_param << "'";
+      throw std::runtime_error(oss.str());
+    }
+    history_policy_ = history->second;
   }
+
+  // QoS
+  auto qos = rclcpp::QoS(rclcpp::QoSInitialization(history_policy_, maximum_queue_size_));
+  qos.reliability(reliability_policy_);
 
   // Publishers
   {
-    pub_output_ = this->create_publisher<PointCloud2>("output", maximum_queue_size_);
-    pub_concat_num_ = this->create_publisher<std_msgs::msg::Int32>("concat_num", 10);
+    pub_output_ = this->create_publisher<PointCloud2>("output", qos);
+    pub_concat_num_ =
+      this->create_publisher<autoware_debug_msgs::msg::Int32Stamped>("concat_num", 10);
     pub_not_subscribed_topic_name_ =
-      this->create_publisher<std_msgs::msg::String>("not_subscribed_topic_name", 10);
+      this->create_publisher<autoware_debug_msgs::msg::StringStamped>("not_subscribed_topic_name", 10);
   }
 
   // Subscribers
@@ -123,7 +163,7 @@ PointCloudConcatenateDataSynchronizerComponent::PointCloudConcatenateDataSynchro
 
       filters_[d].reset();
       filters_[d] = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        input_topics_[d], rclcpp::QoS(maximum_queue_size_), cb);
+        input_topics_[d], qos, cb);
     }
     auto twist_cb = std::bind(
       &PointCloudConcatenateDataSynchronizerComponent::twist_callback, this, std::placeholders::_1);
@@ -262,19 +302,20 @@ void PointCloudConcatenateDataSynchronizerComponent::publish()
   if (!not_subscribed_topic_name.empty()) {
     RCLCPP_WARN_STREAM_THROTTLE(
       this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
-      "Skipped " << not_subscribed_topic_name << ". Please confirm topic." <<
-        "(not_subscribed_topic_name size = )" << not_subscribed_topic_name.size());
+      "Skipped " << not_subscribed_topic_name << ". Please confirm topic.");
   }
 
   if (concat_cloud_ptr_) {
     pub_output_->publish(*concat_cloud_ptr_);
   }
 
-  std_msgs::msg::Int32 concat_num_msg;
+  autoware_debug_msgs::msg::Int32Stamped concat_num_msg;
+  concat_num_msg.stamp = this->now();
   concat_num_msg.data = concat_num;
   pub_concat_num_->publish(concat_num_msg);
 
-  std_msgs::msg::String not_subscribed_topic_name_msg;
+  autoware_debug_msgs::msg::StringStamped not_subscribed_topic_name_msg;
+  not_subscribed_topic_name_msg.stamp = this->now();
   not_subscribed_topic_name_msg.data = not_subscribed_topic_name;
   pub_not_subscribed_topic_name_->publish(not_subscribed_topic_name_msg);
 
@@ -296,6 +337,20 @@ void PointCloudConcatenateDataSynchronizerComponent::convertToXYZCloud(
   output_cloud.header = input_cloud.header;
 }
 
+void PointCloudConcatenateDataSynchronizerComponent::setPeriod(const int64_t new_period)
+{
+  if (!timer_) {return;}
+  int64_t old_period = 0;
+  rcl_ret_t ret = rcl_timer_get_period(timer_->get_timer_handle().get(), &old_period);
+  if (ret != RCL_RET_OK) {
+    rclcpp::exceptions::throw_from_rcl_error(ret, "Couldn't get old period");
+  }
+  ret = rcl_timer_exchange_period(timer_->get_timer_handle().get(), new_period, &old_period);
+  if (ret != RCL_RET_OK) {
+    rclcpp::exceptions::throw_from_rcl_error(ret, "Couldn't exchange_period");
+  }
+}
+
 void PointCloudConcatenateDataSynchronizerComponent::cloud_callback(
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr & input_ptr, const std::string & topic_name)
 {
@@ -308,18 +363,24 @@ void PointCloudConcatenateDataSynchronizerComponent::cloud_callback(
 
   const bool is_already_subscribed_this = (cloud_stdmap_[topic_name] != nullptr);
   // [ROS2 port]: No API to change timer period.
-  // const bool is_already_subscribed_tmp = std::any_of(
-  //   std::begin(cloud_stdmap_tmp_), std::end(cloud_stdmap_tmp_),
-  //   [](const auto & e) { return e.second != nullptr; });
+  const bool is_already_subscribed_tmp = std::any_of(
+    std::begin(cloud_stdmap_tmp_), std::end(cloud_stdmap_tmp_),
+    [](const auto & e) { return e.second != nullptr; });
 
   if (is_already_subscribed_this) {
     cloud_stdmap_tmp_[topic_name] = xyz_input_ptr;
 
     // [ROS2 port]: No API to change timer period.
-    //  if (!is_already_subscribed_tmp) {
-    //   timer_->setPeriod(ros::Duration(timeout_sec_), true);
-    //  timer_->start();
-    // }
+    if (!is_already_subscribed_tmp) {
+      auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(timeout_sec_));
+      try {
+        setPeriod(period.count());
+      } catch (rclcpp::exceptions::RCLError & ex) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, ex.what());
+      }
+      timer_->reset();
+    }
   } else {
     cloud_stdmap_[topic_name] = xyz_input_ptr;
 
@@ -339,7 +400,7 @@ void PointCloudConcatenateDataSynchronizerComponent::cloud_callback(
         });
 
       // [ROS2 port]: generic time on callback handles timer issues
-      // timer_.stop();
+      timer_->cancel();
       publish();
     }
   }
@@ -348,15 +409,20 @@ void PointCloudConcatenateDataSynchronizerComponent::cloud_callback(
 void PointCloudConcatenateDataSynchronizerComponent::timer_callback()
 {
   // [ROS2 port]: assumes all timer issues handled by generic timer - no need to manage
-  // timer_.stop();
+  using std::chrono_literals::operator""ms;
+  timer_->cancel();
   if (mutex_.try_lock()) {
     publish();
     mutex_.unlock();
+  } else {
+    try {
+      std::chrono::nanoseconds period = 10ms;
+      setPeriod(period.count());
+    } catch (rclcpp::exceptions::RCLError & ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, ex.what());
+    }
+    timer_->reset();
   }
-  // else {
-  //   timer_.setPeriod(ros::Duration(0.01), true);
-  //   timer_.start();
-  // }
 }
 
 void PointCloudConcatenateDataSynchronizerComponent::twist_callback(

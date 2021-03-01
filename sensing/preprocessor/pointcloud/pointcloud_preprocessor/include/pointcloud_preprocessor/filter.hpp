@@ -97,6 +97,19 @@ bool get_param(const std::vector<rclcpp::Parameter> & p, const std::string & nam
   return false;
 }
 
+/** \brief QoS policy map */
+static
+std::map<std::string, rmw_qos_reliability_policy_t> name_to_reliability_policy_map = {
+  {"reliable", RMW_QOS_POLICY_RELIABILITY_RELIABLE},
+  {"best_effort", RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT}
+};
+
+static
+std::map<std::string, rmw_qos_history_policy_t> name_to_history_policy_map = {
+  {"keep_last", RMW_QOS_POLICY_HISTORY_KEEP_LAST},
+  {"keep_all", RMW_QOS_POLICY_HISTORY_KEEP_ALL}
+};
+
 /** \brief @b Filter represents the base filter class. Some generic 3D operations that are applicable to all filters
  * are defined here as static methods.
  * \author Radu Bogdan Rusu
@@ -207,6 +220,12 @@ protected:
    * message.
    **/
   bool latched_indices_ = false;
+
+  /** \brief The QoS reliability policy (default: best effort). */
+  rmw_qos_reliability_policy_t reliability_policy_;
+
+  /** \brief The QoS history policy (default: keep last). */
+  rmw_qos_history_policy_t history_policy_;
 
   /** \brief The maximum queue size (default: 3). */
   size_t max_queue_size_ = 3;
